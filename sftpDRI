@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+
+use lib "/usr/local/share/perl";
+use TimeUtilities;
+
+# server info
+my $host = "cftp.dri.edu";
+my $user = "cansac";
+my $pass = "Hamburger1!";
+
+# 1.33km or 4km?
+my $wrf4km   = "wrfout_d02";
+my $wrf4o3km = "wrfout_d03";
+
+# hours to download (zero referenced, ie: 72 hours = 73 files)
+my $hours_to_download = 72;
+
+# my current UTC date is...
+my $current_ymd = `date -u +%Y%m%d`;
+chomp $current_ymd;
+my $default_ymdh = "$current_ymd"."00";
+
+# default expected args
+my %args = (
+                domain => "4km",
+                  ymdh => $default_ymdh,
+          retry_number => 2,
+        retry_interval => 60,
+             post_proc => "/usr/local/bin/ProcessDRI"
+           );
+
+# get cmd line args
+while ( scalar(@ARGV) > 0 ) {
+  my $arg = shift;
+  my $flag = substr($arg,2);
+  usage() if (( $flag =~ /^help|^h/ )||( !exists($args{$flag})));
+  $args{$flag} = ( scalar(@ARGV) ) ? shift : undef;
+}
+
+# check usage
+foreach ( keys %args ) {
+  usage() unless (defined($args{$_}));
+  $args{$flag} = ( scalar(@ARGV) ) ? shift : undef
+}
+
+# extract a few vars from cmd line arg hash and set date
+my $ymdh   = $args{"ymdh"};
+my $domain = $args{"domain"};
+my $retry_interval = $args{"retry_interval"};
+my $retry_number   = $args{"retry_number"};
+
+# convert retry_interval to seconds (from minutes)
+my $retry_interval *= 60;
+
+my $hour   = ($ymdh < 24) ? sprintf("%02d",$ymdh) : substr($ymdh,-2,2);
+if ( $ymdh < 24 ) {
+  $ymdh   = `date --utc +%Y%m%d$hour` if ( $ymdh < 24 );
+  chomp $ymdh;
+}
+check_ymdh_str($ymdh);
+my $ymd       = substr($ymdh,8);
+my $domain_dX = ( $domain eq "4km" ) ? "wrfout_d02" : "wrfout_d03";
+
+# destination dir
+my $dest_dir   = "/storage/Met/CANSAC/$args{domain}/WRF/$ymdh";
+
+# mkdir dist_dir if doesn't exist
+system("mkdir -p $dest_dir") unless ( -e $dest_dir );
+
+# move to dest_dir
+chdir $dest_dir or die("$0: couldn't go to destination directory, $dest_dir\n");
+
+# check for existing files already present
+my @expected_list = CANSACFileList($ymdh,$hours_to_download,$domain);
+my $number_expected = scalar(@expected_list);
+my @received_list = FilesDownloaded($dest_dir,$ymdh,$hours_to_download,$domain);
+my $number_received = scalar(@received_list);
+
+# quick exit if files are already there
+exit() if ( $number_expected == $number_received );
+
+# loop over retry_number
+foreach my $retry ( 0 .. $retry_number ) {
+
+# if files are already present, then chmod to prevent overwritting on next
+# download attempt (will be converted back afterward)
+  if ( $number_received > 0 ) {
+    my $cmd = "chmod a-w wrfout*";
+    system($cmd);
+  }
+
+# download files
+  my $bashscript = "sftp-sshpass.sh";
+  unlink $bashscript if ( -e $bashscript );
+  open(BASHSCRIPT,">",$bashscript) or die("$0: can't open $bashscript\n");
+  print(BASHSCRIPT "#!/bin/bash\n\n");
+  print(BASHSCRIPT "sshpass -p $pass sftp $user\@$host <<EOF\n");
+  print(BASHSCRIPT "cd $ymdh\n");
+  print(BASHSCRIPT "mget $domain_dX\*\n");
+  print(BASHSCRIPT "EOF\n");
+  print(BASHSCRIPT "\nexit\n");
+  close(BASHSCRIPT); 
+
+# execute bash script
+  system("chmod 755 $bashscript");
+  system("./$bashscript");
+
+# remove script
+  unlink $bashscript if ( -e $bashscript );
+
+# check received files
+  @received_list = FilesDownloaded($dest_dir,$ymdh,$hours_to_download,$domain);
+  $number_received = scalar(@received_list);
+
+  if ( $number_received > 0 ) {
+    my $cmd = "chmod ug+w wrfout*";
+    system($cmd);
+  }
+
+# check if number received equals expected amount
+  last if ( $number_received == $number_expected );
+
+# sleep until next attempt (unless this was the last attempt then just exit)
+  if ( $retry != $retry_number ) {
+# TODO: log wait status
+    sleep($retry_interval) 
+  }
+}
+
+# TODO log sucess or failure and run post proc if sucess
+if ( $received_files == $expected_files ) {
+  print("sucess\n");
+  my $cmd = "$args{post_proc} $domain $ymdh";
+  system($cmd);
+}
+else {
+  print("failure\n");
+}
+
+sub CANSACFileList()
+{
+  my $ymdh   = shift;
+  my $hours  = shift;
+  my $domain = shift;
+
+  my $domain_dX = ($args{"domain"} eq "4km" ) ? "wrfout_d02" : "wrfout_d03";
+
+  my $dt_current = get_dt_from_datestr($ymdh);
+  my @FileList;
+
+  foreach ( 00 .. $hours ) {
+     my $dt_new = $dt_current->clone->add(hours => $_ ); 
+     my $file_name_template = "$domain_dX\_%Y-%d-%d\_%H:00:00";
+     my $file_name = dt_to_str($dt_new,$file_name_template);
+     push @FileList,($file_name);
+  }
+  return(@FileList);
+}
+
+sub usage()
+{
+  print "usage: $0 [--ymdh YYYYMMDDHH|HH] [--domain 4km|1.33km]\n";
+  print "\t\tdefault domain is 4km\n";
+  print "\t\tdefault YMDH is 0Z of current UTC date\n";
+  print "\tother optional arguments\n";
+  print "\t\t--retry_interval MIN\tdefault 60 minutes\n";
+  print "\t\t--retry_number N\tdefault 2\n";
+  print "\t  DO NOT make the interval too often or IP may get blocked\n";
+  print "\t  unfortunately not sure what \"too often\" is.\n";
+  exit;
+}
+
+sub FilesDownloaded()
+{
+  my $dest_dir = shift;
+  my $ymdh     = shift;
+  my $hours    = shift;
+  my $domain   = shift;  
+
+  opendir(INPUT,$dest_dir) or
+      die("$0: couldn't change directory to $dest_dir\n");
+  my @wrffiles;
+  if ($domain eq "4km") {
+    @wrffiles = 
+      grep { $_ =~ /^wrfout_d02_\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}$/ }
+        readdir(INPUT);
+  }
+  else {
+    @wrffiles = 
+      grep { $_ =~ /^wrfout_d03_\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}$/ }
+        readdir(INPUT);
+
+  }
+  closedir(INPUT);
+  return(@wrffiles);
+}

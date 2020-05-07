@@ -1,0 +1,268 @@
+#!/usr/bin/perl
+
+########################################################################
+# script to create the arl files from uw's wrf files....this script is #
+# meant to be run via an incrontab routine so ymmv for other purposes  #
+########################################################################
+
+use lib '/usr/local/share/perl';
+
+use Shell qw( cat );
+
+use TimeUtilities;
+use Constants;
+
+# see below for more details...effectively, if we think another instance
+# of this program is running we'll wait up to this amount of time to
+# continue or die.
+my $MAX_WAIT_TIME  = 60;
+# this is how long we wait between checking again.
+my $SLEEP_INTERVAL = 10;
+
+# range of hours per forecast for which we process and create arl input file 
+my %arg_list = ( beginning_hour => 0,
+                    ending_hour => 72,
+                       interval => 1,
+                        verbose => FALSE,
+                      overwrite => FALSE,
+                  arbitrarysize => FALSE,
+              removeoldarlfiles => FALSE,
+
+                  arl12hrblocks => 6,
+
+                        arl12hr => FALSE,
+
+                         DRIMet => "1.33km",
+              );
+
+# loop over caommand line args
+my $arl_inpath = undef;
+my $arl_outpath = undef;
+my $index = 0;
+while ( scalar(@ARGV) > 0) {
+
+# current arg...
+  $_ = shift;
+  if ( /^--|^-/ ) {
+    s/^--|^-//;
+
+# these cmd line args have arguments following them
+    if ( /DRIMet/ ) {
+      $arg_list{DRIMet} = shift;
+      next;
+    }
+
+# these cmd line args invert the current value of the variable
+# by default they're all FALSE so setting the flags changes them to TRUE
+# NOTE: setting switch twice will make FALSE again...
+    $arg_list{$_} = ! $arg_list{$_} if (exists($arg_list{$_}));
+    next;
+  }
+
+# these are the non-dash-prefixed arguments (they must come in order)
+  $arl_inpath  = $_         if ( $index == 0 );
+  $arl_outpath = $_         if ( $index == 1 );
+  $index++;
+}
+
+# set the number of 12 hr blocks....note the 0.99 + is to insure
+# that if insufficient files exist to fill a block of 12 it is
+# still created (and will say, via the name) that it has the files for
+# that period even though it will actually be short...this should be
+# okay as long as it is only the last block that is short and the
+# total number of hours run in the framework doesn't exceed the actual
+# number of hours provided by the short block
+my $b12 = 0.99+(($arg_list{"ending_hour"}-$arg_list{"beginning_hour"})/12);
+$arg_list{"arl12hrblocks"} = int($b12);
+
+my $BEGINNING_HOUR    = $arg_list{"beginning_hour"};
+my $ENDING_HOUR       = $arg_list{"ending_hour"};
+my $INTERVAL_HOURS    = $arg_list{"interval"};
+
+my $verbose           = $arg_list{"verbose"};
+my $overwrite         = $arg_list{"overwrite"};
+my $arbitrarysize     = $arg_list{"arbitrarysize"};
+
+my $removeoldarlfiles = $arg_list{"removeoldarlfiles"};
+
+my $arl12hr           = $arg_list{"arl12hr"};
+my $arl12_blocks      = $arg_list{"arl12hrblocks"};
+
+my $met               = $arg_list{"DRIMet"};
+
+die("$0: met must be 1.33km or 4km\n") unless ( $met =~ /^1.33km$|^4km$/ );
+
+# if arl_output isn't defined set it to same as input
+$arl_outpath = $arl_inpath unless ( defined($arl_outpath) );
+
+# die if arl_inpath isn't defined
+Usage() unless ( defined($arl_inpath) );
+
+# change to directory
+chdir $arl_inpath or Usage("$0: $arl_inpath does not exist.\n");
+
+# what the expected input and output files are called/look like
+
+# stuff that depends on 1.33 or 4km domain
+my $domain = ( $met eq "1.33km" ) ? "3" : "2";
+
+my $arl12hrpath = "/DRI_$met/%Y%m%d%H";
+
+my $arl_4o3km_template  = 'wrfout_d3\.(\d{10})\.f(\d{2})\.arl';
+my $arl_4km_template  = 'wrfout_d2\.(\d{10})\.f(\d{2})\.arl';
+my $arl_template      = ( $met eq "1.33km" ) ? $arl_4o3km_template :
+                                            $arl_4km_template ;
+my $arlout_format     = "wrfout_d$domain.%10d.f%02d.arl";
+
+# only need to create the arlindex file...
+print "create indexfile:\n\tmet path: $arl_inpath\n\tstart: $BEGINNING_HOUR".
+      "\n\tend: $ENDING_HOUR\n\tinterval: $INTERVAL_HOURS\n" if ($verbose);
+create_12hr_arl($BEGINNING_HOUR,$ENDING_HOUR,$arl12_blocks,$arl_inpath,$arl_outpath) if ($arl12hr);
+
+# remove single arl files?
+if ( $removeoldarlfiles ) {
+  opendir(ARLDIR,$arl_inpath) or die("$0: couldn't open directory\n");
+  my @files = sort grep { $_ =~ /$arl_template/ } readdir(ARLDIR);
+  closedir(ARLDIR);
+  unlink @files;
+}
+
+# all done
+exit(0);
+
+sub create_12hr_arl
+{
+  my $interval    = 12;    # by default since this is the create 12hr index sub
+  my $first_hour  = shift; # gives the reference for which group is 1,2,3...
+  my $last_hour   = shift;
+  my $tblocks     = shift; # number of 12hr groups to form
+  my $inputdir    = shift;
+  my $outputdir   = shift;
+
+                           # strictly speaking (for expansion concerns)...the
+                           # number of blocks is actually ( 24/interval )
+                           # if this value is non-integer, then one block
+                           # per day must contain hourly arl files from
+                           # two directories which makes its location ambiguous
+                           # ie, don't do that if possible
+                           #
+                           # creation of blocks of data located outside the
+                           # current directory are assumed to have been/will be
+                           # done via prior/forthcoming call to this script for
+                           # that day and that the grouping/interval
+  
+  opendir(ARLDIR,$inputdir) or die("$0: couldn't open directory\n");
+  my @files = sort grep { $_ =~ /$arl_template/ } readdir(ARLDIR);
+  closedir(ARLDIR);
+
+# get the initialization date time from the first file name (as well as
+# the forecast offset hours (should do a check to make sure it matches
+# the first hour argument but that'll come later).
+  my $temp = $files[0];
+     $temp =~ /$arl_template/;
+
+  my $dt_init  = get_dt_from_datestr($1);
+  my $dt_start = $dt_init->clone->add( hours => $2 );
+  my $dt_end   = $dt_start->clone->add( hours => ($interval -1));
+
+  my $ymdh = dt_to_ymdh($dt_init);
+  system("mkdir -p $outputdir") unless ( -e $outputdir );
+  open(ARL12HR,">","$outputdir/arl12hrindex.csv") or 
+                             die ("couldn't open arl12hrindex file\n");
+  my $header_string = "filename,start,end,interval";
+  print ARL12HR "$header_string\r\n";
+  my @columns = split(/,/,$header_string);
+
+  my $index = 0;
+  my @arlfiles;
+  my $block  = 1;
+  my $blocks = 0;
+  my $total_blocks = ($last_hour - $first_hour)/$interval;
+  my $index_hour   = $first_hour;
+  my $ahour        = $first_hour;
+  my $groups       = 0;
+
+  while ( $index_hour < $last_hour ) {
+    
+    last if ($blocks == $total_blocks);
+    my $arlname = sprintf("wrfout_d$domain.%10d.f%02d.arl",$ymdh,$ahour);
+    push @arlfiles,($arlname);
+    $ahour++;
+    $index++;
+
+# time to write out the group info and create the .arl file (if not present)
+    if ($index == $interval ) {
+      my $begin_hour = $first_hour + ($block - 1) * $interval;
+      my $end_hour   = $first_hour +  $block      * $interval - 1;
+      print "block: $block   starting hour: $begin_hour  ".
+            " ending hour: $end_hour\n" if ($verbose);
+
+      my $date_str  = dt_to_ymdh($dt_init);
+
+      my $arlout    = sprintf("wrfout_d$domain.%s.f%02d-%02d_12hr%02d.arl",
+                              $date_str,$begin_hour,$end_hour,$block);
+      #my $directory = dt_to_str($dt_init,$arl12hrpath);
+      #print "arlfile: $directory/$arlout\n" if ($verbose);
+
+      my $start_str = dt_to_str($dt_start,"%Y-%m-%d %H:00:00");
+      my $end_str   = dt_to_str($dt_end,"%Y-%m-%d %H:00:00");
+
+      #my $csv_string = "$directory/$arlout,$start_str,$end_str,$interval\r\n";
+      my $csv_string = "$arlout,$start_str,$end_str,$interval\r\n";
+      print ARL12HR $csv_string;
+
+# how many files do we have in list
+      my $num_files_in_list = scalar(@arlfiles);
+
+# if arbitrarysize is false AND number of files in list is not equal
+# to interval length, exit the loop as there are files missing
+# (need to be careful to update this for interval hours with stepsize 
+# between each file to account for say the 3hourly NWS data)
+      last if ((! $arbitrarysize) && ( $num_files_in_list != $interval));
+      my $catlist           = join(' ',@arlfiles);
+      my $outfile           = "$outputdir/$arlout";
+      if ( $verbose ) {
+        print("arlfiles in group: ");
+        foreach my $file ( @arlfiles ) {
+          print "\t\t$file\n";
+        }
+      }
+      cat($catlist,">",$outfile) if ((! -e $outfile ) ||
+                                     (( -e $outfile ) && $overwrite ));
+
+      @arlfiles = ();
+
+      $dt_start->add( hours => $interval );
+      $dt_end->add( hours => $interval );
+
+      $index = 0;
+      $block++;
+      $blocks++;
+      $index_hour++;
+    }
+  }
+  close(ARL12HR);
+}
+
+sub Usage
+{
+  my $error_string = ( scalar(@_) ) ? shift : undef;
+
+  print "error: $error_string\n" if (defined($error_string));
+  print "usage: $0 [optional_flags] arl_input_dir [arl_output_dir]\n";
+  print "\t\tarl_output_dir = arl_input_dir if not given\n\n";
+  print "\toptional flags\t\t\tdefault value\n";
+  print "\t\tsetting flag for a T or F cmdline arg inverts its value\n";
+  print "\t\te.g., verbose is normally false so setting --verbose\n";
+  print "\t\t      turns verbosity on. currently all T-F flags default to F\n";
+  print "\t\t--beginning_hour hour\t\t$arg_list{beginning_hour}\n";
+  print "\t\t--ending_hour hour\t\t$arg_list{ending_hour}\n";
+  print "\t\t--interval hour(s)\t\t$arg_list{interval}\n";
+  print "\t\t--verbose\t\t\t",TorF($arg_list{verbose}),"\n";
+  print "\t\t--overwrite\t\t\t",TorF($arg_list{overwrite}),"\n";
+  print "\t\t--arbitrarysize\t\t\t",TorF($arg_list{arbitrarysize}),"\n";
+  print "\n";
+  exit(-1);
+}
+
+sub TorF { $_ = shift; return(( $_ ) ? "True" : "False"); }

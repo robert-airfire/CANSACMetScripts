@@ -1,0 +1,242 @@
+#!/usr/bin/perl
+
+# ########################################################### #
+# use the arw2arl program to create arl files from wrf output #
+# ########################################################### #
+
+# time to wait between retrials to get wrf files (in sec)
+my $retry_interval  = 180;
+
+# after waiting this long, abort trying to wait for arrival of wrf data (in sec)
+my $abort_time      = 18000;
+
+# number of wrf files to wait for (1.33 and 4km are assumed to be the same)
+# no attemnpt is made to determine which (if any) have yet to arrive if
+# number is less than this count;
+my $expected_number = 73;
+
+# get date otherwise use local time (ie, launch after midnight)
+die("usage: @0 1.33km|4km hh|yyyymmddhh\n") if (scalar(@ARGV) != 2);
+
+# if argument is < 24 then it concidered an hour otherwise the full
+# yyyymmddhh string;
+my $MET = shift;
+my $arg = shift;
+
+# check usage of MET
+die("usage: @0 1.33km|4km hh|yyyymmddhh\n") 
+   if (($MET ne "4km")&&($MET ne "1.33km"));
+
+# current GMT time
+my $ymd = `date -u +%Y%m%d`;
+chomp $ymd;
+
+# is arg ymdh or hh?
+my $hh = ( $arg < 24) ? sprintf("%02d",$arg) : "";
+my $ymdh = ($arg > 23) ? $arg : $ymd.$hh ;
+
+# where the data lives
+# my $wrf_dir = "/bluesky/met/WRF/$ymdh/wrf"; # this was on the playground box
+my $wrf_dir = "/data/Met/CANSAC/$MET/WRF/$ymdh";
+
+# arl input dir
+my $arl_input_dir = $wrf_dir;
+
+# output directory
+my $arl_output_dir      = "/storage/Met/CANSAC/$MET/ARLtest";
+my $arl_output_dir_ymdh = "$arl_output_dir/$ymdh";
+
+# logger stuff
+my $procname = (split(/\//,$0))[-1];
+my $metname  = "CANSAC $MET";
+my $step     = "Process CANSAC $MET WRF files";
+
+# timing stuff
+my $time_waited = 0;
+my $status = 0;
+my $wrf_dir_exists = 0;
+my @wrffiles;
+
+my $message = "Processing CANSAC $MET WRF files.";
+my $action  = "Start";
+my $logstatus  = "Good";
+MetLogger($procname,$metname,$ymdh,$action,$logstatus,$message);
+
+# ################################################
+# loop for waiting for the arrival of the WRF data
+while (($status == 0) && ($time_waited < $abort_time)) {
+
+# go to the wrf dir....NOTE: don't want to die, script may have started
+# before directory exists.
+  chdir $wrf_dir if ( -e $wrf_dir );
+
+# get the appropriate files
+  opendir(TEMP,$wrf_dir) or warn("$0: $wrf_dir doesn't exist\n"); 
+
+# process files: do we want 1.33km or ....
+  if ($MET =~ /^1.33km$/) {
+    @wrffiles = 
+        grep { $_ =~ /^wrfout_d03_\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}$/ }
+           readdir(TEMP);
+  }
+
+# ============== ... 4km wrf files
+  elsif ($MET =~ /^4km$/) {
+    @wrffiles = 
+        grep { $_ =~ /^wrfout_d02_\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}$/ }
+           readdir(TEMP);
+  }
+  else {
+    die("$0: unknow met source $MET. should be 1.33km or 4km.\n");
+  }
+  closedir(TEMP);
+
+# check number of files found for both 2 and 4km domaains
+  my $numfiles = scalar(@wrffiles); 
+
+# found all
+  $status = 1 if ($numfiles == $expected_number);
+  last if ($status == 1);   
+
+# print out some info saying we're waiting....
+  print "$0: didn't find all expected wrf files\n";
+  print "\tfound $numfiles of $expected_number $MET wrf files.\n";
+  print "\twaiting $retry_interval sec.    ";
+  print "will give up in ",($abort_time-$time_waited)," secs.\n";
+
+# send to logger but not every time
+  my $message = "found $numfiles of $expected_number $MET wrf files.";
+  my $action  = "Waiting";
+  my $logstatus  = "Warning";
+  MetLogger($procname,$metname,$ymdh,$action,$logstatus,$message)
+      if ($time_waited%($retry_interval*7) == 0);
+
+# wait
+  sleep($retry_interval);
+  $time_waited += $retry_interval;
+}
+
+# check status on loop exit to see if we actually found all the files...
+# abort if not;
+unless ($status) {
+  my $message = "Wait time exceeded for arrival of wrf files. abort!";
+  my $action  = "Die";
+  my $logstatus  = "Failure";
+  MetLogger($procname,$metname,$ymdh,$action,$logstatus,$message);
+  die("$0: $message\n");
+}
+# end of loop to wait for arrival of WRF data
+# ###########################################
+
+# arw2arl output files to potentially clean up
+#my @arw_output = qw( ARLDATA.BIN ARLDATA.CFG WRFDATA.CFG WRFRAIN.BIN );
+my @arw_output = qw( ARWDATA.BIN ARWDATA.CFG ARWRAIN.BIN );
+
+# ##############################################
+# loop over wrf files and convert to arl format
+# note: modified to place the output for the
+#       1.33km and 4km in different directories
+#       to prevent them from stomping on each
+#       other if the 1.33 & 4km processdri cmds are
+#       runnning at the same time
+my $cmd;
+my $index = 0;
+mkdir $MET unless ( -e $MET );
+chdir $MET;
+foreach ( sort @wrffiles ) {
+
+# remove the intermediate files (if there)
+  foreach my $temp ( @arw_output ) { unlink $temp if ( -e $temp ); }
+
+# note arw2arl allows for a 'custom' WRFDATA.CFG file ... however, the
+# example that includes TKE doesn't work with the DRI WRF output.
+  #$cmd = 'cp /home/driwrf/WRF/WRFDATA.TKE WRFDATA.CFG; '.
+  #       '/home/driwrf/bin/arw2arl '.$_;
+  #$cmd = '/home/driwrf/bin/arw2arl '.$_.' > /dev/null';
+  #$cmd = "/usr/local/bin/arw2arl ../$_ > /dev/null";
+  $cmd = "/usr/local/bin/arw2arl ../$_ > /dev/null";
+  my $arl_filename;
+  $arl_filename = ($MET =~ /1.33km/) ?
+                  sprintf("../wrfout_d3.%s.f%02d.arl",$ymdh,$index++) :
+                  sprintf("../wrfout_d2.%s.f%02d.arl",$ymdh,$index++);
+
+# convert wrf to arl unless arl file already exists and cleanup temp files
+  unless ( -e $arl_filename ) {
+    system($cmd);
+    rename "ARWDATA.BIN",$arl_filename;
+    foreach my $temp ( @arw_output ) { unlink $temp if ( -e $temp ); }
+  }
+}
+
+# make arl data groups for 1.33km data
+chdir $wrf_dir;
+$cmd = "/usr/local/bin/MakeARLGroups --DRIMet $MET --arl12hr ".
+       "--removeoldarlfiles --overwrite $arl_input_dir $arl_output_dir_ymdh";
+system($cmd);
+
+# setup rsync commands: 1.33km goes to bandit and uwfs
+#                       4km goes to bandit
+my @rsync_uwfs;
+my @rsync_judy;
+my @rsync_aws;          # ubuntu@www.airfire.org EFS mount
+
+if ($MET =~ /1.33km/) {
+   $rsync_uwfs[0] = "rsync --size-only --recursive $arl_output_dir_ymdh ".
+                   'robert@uwfs.atmos.washington.edu:/storage/ARL/DRI_2km';
+   $rsync_judy[0] = "rsync --size-only --recursive $arl_output_dir_ymdh ".
+                   'metdata@128.95.182.50:/data/Met/CANSAC/1.33km/ARL';
+   $rsync_aws[0] = "rsync --size-only --recursive $arl_output_dir_ymdh ".
+                   'ubuntu@www.airfire.org:/storage/Met/CANSAC/1.33km/ARL';
+}
+else {
+
+# don't rsync 4km to vacuum since playground doesn't use it
+   $rsync_judy[0] = "rsync --size-only --recursive $arl_output_dir_ymdh ".
+                   'metdata@128.95.182.50:/data/Met/CANSAC/4km/ARL';
+}
+
+
+#system ($_) foreach ( @rsync_uwfs );
+#system ($_) foreach ( @rsync_judy );
+#system ($_) foreach ( @rsync_aws );
+
+# clean up and gzip the wrf files
+my $cmd = "find . -name \'*00:00\' -exec gzip -v {} \\;";
+#system($cmd);
+
+my $message = "Processed CANSAC $MET WRF files.";
+my $action  = "Finish";
+my $logstatus  = "Good";
+MetLogger($procname,$metname,$ymdh,$action,$logstatus,$message);
+
+# cleanup directory
+chdir $wrf_dir;
+rmdir $MET;
+
+exit(1);
+
+sub MetLogger
+{
+my $procname  = shift;
+my $metname   = shift;
+my $ymdh      = shift;
+my $action    = shift;
+my $logstatus = shift;
+my $message   = shift;
+
+# logger info
+my $API_ENDPOINT = 'https://status-log.airfire.org/status-logs';
+my $API_KEY      = "700824e31cfe11e4a89f3c15c2c6639e";
+my $API_SECRET   = "73fa27801cfe11e481873c15c2c6639e";
+
+# log cmd
+my $logcmd  = "/usr/local/bin/log-status.py ".
+              "-e \"$API_ENDPOINT\" -k $API_KEY -s $API_SECRET ".
+              "-p $procname -o $logstatus ".
+              "-f domain=\"$metname\" ".
+              "-f initialization_time=$ymdh ".
+              "-f step=\"$step\" ".
+              "-f action=\"$action\" ".
+              "-f comments=\"$message\"";
+system($logcmd);
+}
